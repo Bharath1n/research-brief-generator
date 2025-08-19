@@ -54,7 +54,6 @@ if st.button("Generate Brief"):
                 st.markdown("### References")
                 for ref in brief['references']:
                     st.markdown(f"- [{ref['source_url']}]({ref['source_url']}) (Relevance: {ref['relevance']})")
-                    st.write("Key Points: " + "; ".join(ref['key_points']))
             except Exception as e:
                 st.error(f"Error: {e}")
 

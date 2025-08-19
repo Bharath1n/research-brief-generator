@@ -12,7 +12,6 @@ class ResearchPlan(BaseModel):
 class SourceSummary(BaseModel):
     """Summary of an individual source."""
     source_url: str
-    key_points: List[str]
     relevance: float = Field(..., ge=0, le=1)  # 0-1 score
 
 class FinalBrief(BaseModel):

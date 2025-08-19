@@ -2,20 +2,19 @@ import os
 import requests
 import logging
 import json
+from typing import List
 from bs4 import BeautifulSoup
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_huggingface import HuggingFaceEndpoint
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import HumanMessage, AIMessage
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from torch import cuda
 from .state import AppState
-from .schemas import ResearchPlan, SourceSummary, FinalBrief
+from .schemas import ResearchPlan, SourceSummary, FinalBrief, Section
 from .history import load_history, save_brief
-from .tools import search_tool
+from .tools import search_wrapper
 from dotenv import load_dotenv
-from pydantic import parse as parser
+from pydantic import BaseModel, ValidationError
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -23,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 # Initialize LLMs
 llm_gemini = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-# Initialize Hugging Face BART model for summarization
-tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
-hf_model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large-cnn")
-if cuda.is_available():
-    hf_model = hf_model.to('cuda')  # Move to GPU if available
+llm_hf = HuggingFaceEndpoint(
+    repo_id="tiiuae/falcon-7b-instruct",
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    task="text-generation",
+    temperature=0,
+    max_new_tokens=256
+)
 
 def context_summarization(state: AppState) -> AppState:
     if not isinstance(state, dict):
@@ -37,153 +38,182 @@ def context_summarization(state: AppState) -> AppState:
     if not state.get("follow_up", False):
         return state
     prior_briefs = load_history(state["user_id"])
+    logger.debug(f"Prior briefs for user_id {state['user_id']}: {prior_briefs}")
     prompt = ChatPromptTemplate.from_template("Summarize prior briefs: {priors}")
     chain = prompt | llm_gemini | (lambda x: {"context_summary": x.content})
     try:
         result = with_retry(chain, {"priors": prior_briefs})
         state["context_summary"] = result["context_summary"]
+        logger.info(f"Context summary generated: {state['context_summary'][:100]}...")
     except Exception as e:
         logger.warning(f"Context summarization failed: {e}. Using empty summary.")
         state["context_summary"] = ""
     return state
 
-def hf_summarize(url, content):
-    if not content or "Fetch error" in content:
-        return parser.parse({"source_url": url, "key_points": ["No content available"], "relevance": 0.1})
-    inputs = tokenizer(f"Summarize: {content}", return_tensors="pt", truncation=True, max_length=512, padding="max_length")
-    inputs = {k: v.to(hf_model.device) for k, v in inputs.items()}
-    outputs = hf_model.generate(**inputs, max_length=150, min_length=40, no_repeat_ngram_size=2)
-    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    logger.info(f"Summary for {url}: {summary}")
-    return parser.parse({"source_url": url, "key_points": [summary], "relevance": 0.9})
-
 def planning(state: AppState) -> AppState:
-    parser = PydanticOutputParser(pydantic_object=ResearchPlan)
+    context_str = f"Based on prior context: {state['context_summary']}" if state.get("follow_up", False) else ""
     prompt = ChatPromptTemplate.from_template(
-        "Plan research for {topic}. Depth: {depth}. Context: {context}. Return a JSON object with a 'steps' field containing a list of research steps. {format_instructions}"
-    ).partial(format_instructions=parser.get_format_instructions())
-    chain = prompt | llm_gemini
-
-    for attempt in range(3):  # Retry 3 times
-        try:
-            output = chain.invoke({"topic": state["topic"], "depth": state["depth"], "context": state["context_summary"] or ""})
-            logger.debug(f"Raw LLM output (attempt {attempt + 1}): {output.content}")
-            state["plan"] = parser.parse(output.content)
-            logger.info(f"Successfully parsed research plan on attempt {attempt + 1}")
-            break
-        except OutputParserException as e:
-            logger.warning(f"Parse failed (attempt {attempt + 1}): {str(e)}")
-            fix_prompt = ChatPromptTemplate.from_template(
-                "The following output is invalid JSON for a research plan with a 'steps' list. Fix it to match the schema: {schema}. Invalid output: {invalid_output}"
-            ).partial(schema=parser.get_format_instructions())
-            fix_chain = fix_prompt | llm_gemini
-            fixed_output = fix_chain.invoke({"invalid_output": output.content})
-            logger.debug(f"Fixed output attempt {attempt + 1}: {fixed_output.content}")
-            try:
-                state["plan"] = parser.parse(fixed_output.content)
-                logger.info(f"Successfully fixed and parsed on attempt {attempt + 1}")
-                break
-            except OutputParserException as e2:
-                logger.warning(f"Fix attempt {attempt + 1} failed: {str(e2)}")
-                if attempt == 2:  # Last attempt
-                    raise ValueError("Failed to parse research plan after retries")
-    else:
-        raise ValueError("Failed to parse research plan after retries")
-
+        """Create a detailed research plan for the topic: {topic}. {context}
+The plan should consist of 3-5 specific search steps or queries to gather information."""
+    )
+    structured_llm = llm_gemini.with_structured_output(ResearchPlan)
+    chain = prompt | structured_llm
+    try:
+        plan = with_retry(chain, {"topic": state["topic"], "context": context_str})
+        state["plan"] = plan
+        logger.info(f"Generated research plan: {plan.steps}")
+    except Exception as e:
+        raw_input = {"topic": state["topic"], "context": context_str}
+        logger.error(f"Planning failed: {e}. Raw output: {llm_gemini.invoke(prompt.format_messages(**raw_input)).content}")
+        state["plan"] = ResearchPlan(steps=[f"Search for recent information on {state['topic']}"])
     return state
 
 def search(state: AppState) -> AppState:
-    try:
-        query = f"recent articles on {state['topic']}"
-        results = search_tool.invoke({"query": query, "max_results": state["depth"] * 3})
-        logger.info(f"Raw Tavily response: {results}")
-        if isinstance(results, str):
-            results = json.loads(results)
-        state["sources"] = [r["url"] for r in results.get('results', []) if isinstance(r, dict) and "url" in r]
-        logger.info(f"Found {len(state['sources'])} sources: {state['sources']}")
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        state["sources"] = []
+    sources = []
+    max_queries = 3
+    for step in state["plan"].steps[:max_queries]:
+        if not isinstance(step, str):
+            logger.warning(f"Invalid search step type: {type(step)} for step: {step}")
+            continue
+        try:
+            logger.debug(f"Executing search for query: {step}")
+            results = search_wrapper(step)
+            if not isinstance(results, list):
+                logger.warning(f"Search tool returned non-list results for query '{step}': type={type(results)}, value={results}")
+                continue
+            for result in results:
+                if isinstance(result, dict) and "url" in result:
+                    sources.append(result["url"])
+                elif isinstance(result, dict) and "content" in result:
+                    logger.warning(f"No URL found for result with content: {result['content'][:50]}... Using placeholder.")
+                    sources.append(f"https://placeholder-{hash(result['content'])}.com")
+                else:
+                    logger.warning(f"Invalid result format: {result}")
+        except Exception as e:
+            logger.warning(f"Search failed for step '{step}': {e}")
+    state["sources"] = sources
+    logger.info(f"Search node completed. Sources found: {len(sources)} - {sources}")
     return state
 
 def content_fetching(state: AppState) -> AppState:
     contents = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     for url in state["sources"]:
-        try:
-            response = requests.get(url, timeout=15, headers=headers)
-            response.raise_for_status()  # Raises exception for 4xx/5xx errors
+        for attempt in range(3):
             try:
-                soup = BeautifulSoup(response.text, 'lxml')
-            except Exception as e:
-                logger.warning(f"lxml parser failed for {url}: {e}. Falling back to html.parser")
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
                 soup = BeautifulSoup(response.text, 'html.parser')
-            content = ' '.join(p.get_text() for p in soup.find_all(['p', 'div']) if p.get_text().strip())[:2000]
-            if not content:
-                content = "No usable content found, possibly JavaScript-rendered."
-            contents.append(content)
-            logger.info(f"Fetched content length from {url}: {len(content)}")
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 403:
-                logger.warning(f"Failed to fetch {url}: 403 Forbidden. Using fallback content.")
-                # Attempt to use Tavily raw_content if available (requires adjusting search_tool)
-                contents.append(f"Access denied: {str(e)}")
-            else:
-                logger.warning(f"Failed to fetch {url}: {e}")
-                contents.append(f"Fetch error for {url}: {str(e)}")
+                content = soup.get_text(separator='\n', strip=True)
+                contents.append(content)
+                logger.debug(f"Fetched content from {url}: {content[:100]}...")
+                break
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+                if attempt == 2:
+                    contents.append(f"Fetch error: {str(e)}")
     state["contents"] = contents
+    logger.info(f"Content fetching completed. Contents retrieved: {len(contents)}")
     return state
 
 def per_source_summarization(state: AppState) -> AppState:
-    parser = PydanticOutputParser(pydantic_object=SourceSummary)
     prompt = ChatPromptTemplate.from_template(
-        "Summarize source {url}: {content}. {format_instructions}"
-    ).partial(format_instructions=parser.get_format_instructions())
-
-    def hf_summarize(url, content):
-        if not content or "Fetch error" in content or "Access denied" in content:
-            error_msg = content if "Fetch error" in content or "Access denied" in content else "No content available"
-            logger.warning(f"Skipping summarization for {url}: {error_msg}")
-            return SourceSummary(source_url=url, key_points=[error_msg], relevance=0.1)
-        inputs = tokenizer(f"Summarize: {content}", return_tensors="pt", truncation=True, max_length=512, padding="max_length")
-        inputs = {k: v.to(hf_model.device) for k, v in inputs.items()}
-        outputs = hf_model.generate(**inputs, max_length=150, min_length=40, no_repeat_ngram_size=2)
-        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        logger.info(f"Generated summary for {url}: {summary[:100]}...")
-        return SourceSummary(source_url=url, key_points=[summary], relevance=0.9)
-
-    summaries = [hf_summarize(url, content) for url, content in zip(state["sources"], state["contents"])]
-    state["summaries"] = summaries
-    logger.info(f"Generated {len(summaries)} summaries")
+        """Assess the relevance of the content from {url} to the topic '{topic}' on a scale of 0 to 1.
+{content}"""
+    )
+    structured_llm = llm_gemini.with_structured_output(SourceSummary)
+    chain = prompt | structured_llm
+    summaries = []
+    for url, content in zip(state["sources"], state["contents"]):
+        if "error" in content.lower() or len(content.strip()) == 0:
+            summaries.append(SourceSummary(source_url=url, relevance=0.1))
+            logger.debug(f"Fallback summary for {url}: relevance=0.1")
+            continue
+        try:
+            truncated_content = content[:4000]
+            summary = with_retry(chain, {"url": url, "content": truncated_content, "topic": state["topic"]})
+            if summary is not None:
+                summaries.append(summary)
+                logger.debug(f"Generated summary for {url}: relevance={summary.relevance}")
+            else:
+                logger.warning(f"LLM returned None for {url}. Using fallback.")
+                summaries.append(SourceSummary(source_url=url, relevance=0.5))
+        except Exception as e:
+            logger.warning(f"Summarization failed for {url}: {e}")
+            summaries.append(SourceSummary(source_url=url, relevance=0.5))
+    if not summaries:
+        logger.warning("No summaries generated. Adding fallback summary.")
+        summaries.append(SourceSummary(
+            source_url="https://example.com",
+            relevance=0.3
+        ))
+    valid_summaries = [s for s in summaries if s is not None]
+    logger.info(f"Generated {len(valid_summaries)} valid source summaries: {[s.source_url for s in valid_summaries]}")
+    state["summaries"] = valid_summaries
     return state
 
 def synthesis(state: AppState) -> AppState:
     logger.debug("Entering synthesis node")
-    prompt = ChatPromptTemplate.from_template("Synthesize a brief on {topic} based on the following summaries: {summaries}")
-    chain = prompt | llm_gemini
-    state["synthesized_brief"] = with_retry(chain, {"topic": state["topic"], "summaries": state["summaries"] or []}).content
+    prompt = ChatPromptTemplate.from_template(
+        """Synthesize a comprehensive brief on the topic '{topic}' based on the following source summaries:
+{summaries}
+Integrate key points logically, resolve any contradictions, and provide a cohesive narrative.
+If no summaries are available, provide a brief overview based on general knowledge of the topic."""
+    )
+    chain = prompt | llm_gemini | StrOutputParser()
+    try:
+        summaries_json = json.dumps([s.model_dump() for s in state["summaries"] or []])
+        if not state["summaries"]:
+            logger.warning("No summaries available for synthesis. Using general overview.")
+            summaries_json = "No source summaries available."
+        synthesized = with_retry(chain, {"topic": state["topic"], "summaries": summaries_json})
+        state["synthesized_brief"] = synthesized
+        logger.debug(f"Synthesized brief: {synthesized[:100]}...")
+    except Exception as e:
+        logger.error(f"Synthesis failed: {e}")
+        state["synthesized_brief"] = f"Failed to synthesize brief for {state['topic']}. No source information available."
     logger.info("Synthesis completed")
     return state
 
+class PartialFinalBrief(BaseModel):
+    summary: str
+    sections: List[Section]
+
 def post_processing(state: AppState) -> AppState:
     logger.debug("Entering post_processing node")
-    parser = PydanticOutputParser(pydantic_object=FinalBrief)
+    logger.info(f"State summaries before post-processing: {len(state['summaries'])} - {[s.source_url for s in state['summaries']]}")
     prompt = ChatPromptTemplate.from_template(
-        "Format a final brief on {topic} with the following synthesized content: {synth}. Ensure the summary and sections are relevant to the topic. {format_instructions}"
-    ).partial(format_instructions=parser.get_format_instructions())
-    chain = prompt | llm_gemini | parser
-    final = with_retry(chain, {"topic": state["topic"], "synth": state["synthesized_brief"] or "No synthesis available"})
-    final.topic = state["topic"]
-    final.references = [summary.model_dump() for summary in state["summaries"]]
-    state["final_brief"] = final
-    save_brief(state["user_id"], final.model_dump_json())
+        """Format the synthesized content into a structured research brief on the topic '{topic}'.
+Synthesized content: {synth}
+Include a high-level summary, detailed sections with titles and content."""
+    )
+    structured_llm = llm_gemini.with_structured_output(PartialFinalBrief)
+    chain = prompt | structured_llm
+    try:
+        partial = with_retry(chain, {"topic": state["topic"], "synth": state["synthesized_brief"] or "No synthesis available"})
+        final = FinalBrief(
+            topic=state["topic"],
+            summary=partial.summary,
+            sections=partial.sections,
+            references=state["summaries"]
+        )
+        state["final_brief"] = final
+        save_brief(state["user_id"], final.model_dump_json())
+        logger.info(f"Final brief generated with {len(final.references)} references")
+    except Exception as e:
+        raw_input = {"topic": state["topic"], "synth": state["synthesized_brief"] or "No synthesis available"}
+        logger.error(f"Post-processing failed: {e}. Raw output: {llm_gemini.invoke(prompt.format_messages(**raw_input)).content}")
+        raise ValueError("Failed to generate final brief")
     logger.info("Post-processing completed")
     return state
 
 def with_retry(chain, inputs, max_retries=3):
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
         try:
-            return chain.invoke(inputs)
-        except OutputParserException:
-            pass
-    raise ValueError("Failed after retries")
+            result = chain.invoke(inputs)
+            return result
+        except (OutputParserException, ValidationError) as e:
+            logger.warning(f"Error on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+    logger.error(f"Max retries reached. Returning None.")
+    return None

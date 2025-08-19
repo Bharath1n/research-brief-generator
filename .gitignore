@@ -8,5 +8,12 @@ __pycache__/
 # Database files
 history.db
 
+# Log files
+*.log
+
 # Virtual environments
 venv/
+.venv/
+
+# Vercel
+.vercel
