@@ -1,52 +1,84 @@
-# Research Brief Generator
+Context-Aware Research Brief Generator
+A research assistant that generates structured, evidence-linked briefs with follow-up support using LangGraph and LangChain. Features a deployed API, CLI, and optional Streamlit UI.
 
-## Problem Description
-[Copy from assignment PDF objective]
+Deployment: https://research-brief-generator-5c5c.onrender.com
+Repo: https://github.com/Bharath1n/research-brief-generator
 
-## Core Components
-- **LangGraph Workflow**: [Existing, add] Uses MemorySaver for checkpointing, enabling resumable executions per user.
+Problem Statement and Objective
+Creates research briefs from user topics with web evidence, supporting follow-up queries with context. Aims to use LangGraph for orchestration, LangChain for abstraction, and Pydantic for schema validation, with a deployed API and CLI.
 
-## Graph Description
-[Existing, keep Mermaid]
+Graph Architecture
+Uses a StateGraph with 7 nodes for processing.
 
-## Model and Tool Selection Rationale
-- **Gemini (gemini-1.5-flash)**: Used for context and per-source summarization due to speed and low cost for high-volume, precise tasks (temperature=0).
-- **Grok (grok-beta)**: Used for planning, synthesis, and post-processing for superior reasoning and truth-seeking in complex integration steps. Fallback to Gemini if xAI API unavailable.
-- **Tavily**: Reliable for web search with built-in relevance filtering.
-- **Content Fetching**: Async with aiohttp for performance, parsing via BeautifulSoup.
+Visual Representation
+mermaidgraph TD
+    A[API/CLI] --> B[Context Summarization]
+    A --> C[Planning]
+    B --> C
+    C --> D[Search (Tavily)]
+    D --> E[Content Fetching (BSoup)]
+    E --> F[Per-Source Summ (Gemini)]
+    F --> G[Synthesis (Gemini)]
+    G --> H[Post-Processing]
+    H --> I[FinalBrief JSON]
+    I --> J[Streamlit (Local)]
+    I --> K[SQLite History]
+    L[Checkpointing] --> B & C & D & E & F & G & H
 
-## Schema Definitions and Validation Strategy
-- **ResearchPlan**: Pydantic model with `steps: List[str]`. Validates research steps.
-- **SourceSummary**: `source_url: str`, `key_points: List[str]`, `relevance: float (0-1)`. Ensures structured source analysis.
-- **FinalBrief**: `topic: str`, `summary: str`, `sections: List[Section]`, `references: List[SourceSummary]`. Where `Section` is `title: str`, `content: str`.
-- Validation: Pydantic parsers in LLM chains with auto-retries (up to 3) on OutputParserException.
+Nodes: Context Summarization, Planning, Search, Content Fetching, Per-Source Summarization, Synthesis, Post-Processing.
+Flow: Conditional follow_up entry, checkpointing with MemorySaver.
+Note: Export this Mermaid code at mermaid.live as PNG and replace with ![Diagram](diagram.png) after uploading.
 
-## Usage Examples
-[Existing, add structured output examples from schemas.py]
+Model and Tool Selection
 
-## Deployment
-[Existing, add] Ensure all env vars set in Vercel. For local: `uvicorn app.api:api_app --reload`
+Gemini (gemini-1.5-flash): Fast, cost-effective LLM for summarization and synthesis.
+Tavily: Efficient web search with relevance filtering.
+BeautifulSoup: Reliable content parsing.
+Rationale: Optimized for cost and speed; HuggingFace removed to fix Vercel OOM.
 
-## Benchmarks and Observability
-- Latency: ~5-15s for depth=3 (improved with async fetching; measured on M1 Mac).
-- Tokens: ~3000-6000 per run (tracked via LangChain callbacks; cost ~$0.01-0.03 USD with Gemini/Grok mix).
-- Use LangSmith for tracing (env vars enabled). Example trace screenshot: [insert or link].
+Schema Definitions and Validation
 
-## Limitations
-- [Existing, add] Potential rate limits on APIs; no multi-modal content handling; SQLite not sharded for high-scale.
+Schemas (schemas.py):
 
-## Optional Enhancements
-- Aesthetic Streamlit UI with history viewer.
-- Async backend for better concurrency.
-- Token tracking for cost monitoring.
-- Enhanced tests with mocks.
+ResearchPlan: List[str] for steps.
+SourceSummary: source_url: str, relevance: float (0-1).
+FinalBrief: topic: str, summary: str, sections: List[Section], references: List[SourceSummary].
+Validation: Pydantic with with_structured_output, API input checks, and with_retry (3 attempts) for errors.
 
-## Setup
-1. Clone repo.
-2. `pip install -r requirements.txt`
-3. Copy `.env.example` to `.env` and fill keys.
-4. Run API: `uvicorn app.api:api_app --reload`
-5. Run Streamlit: `streamlit run frontend.py`
-6. Tests: `pytest`
+Deployment Instructions
+Prerequisites
+Python 3.9+
+Git
+API keys (Google, Tavily)
 
-LICENSE: MIT
+Local
+
+Clone: git clone https://github.com/Bharath1n/research-brief-generator
+Install: pip install -r requirements.txt
+Set .env from .env.example with API keys.
+Run API: uvicorn app.api:api_app --reload
+Run UI: streamlit run frontend.py
+Use make (optional): make install, make run.
+
+Render
+
+Sign up at render.com.
+New Web Service, connect repo.
+Set: Python runtime, pip install -r requirements.txt, uvicorn app.api:api_app --host 0.0.0.0 --port $PORT.
+Add env vars.
+Deploy (5-10 min).
+
+Streamlit
+Run: streamlit run frontend.py, enter params, click "Generate Brief".
+
+Cost and Latency Benchmarks
+
+Latency: 5-15s (depth=3, local/Render with cold starts).
+Tokens: 3000-6000/run.
+Cost: ~$0.01-0.03 (Gemini) + ~$0.001 (Tavily).
+Tracing: LangSmith enabled, [insert trace link/screenshot].
+
+Limitations and Areas for Improvement
+
+Limits: API rate caps, no multi-modal, SQLite scalability issues, free tier cold starts.
+Improvements: Async fetching, multi-LLM, token tracking, enhanced tests, scalable DB.
