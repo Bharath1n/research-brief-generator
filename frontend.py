@@ -37,7 +37,7 @@ if st.button("Generate Brief"):
         with st.spinner("Generating brief..."):
             try:
                 response = requests.post(
-                    "http://localhost:8000/brief",  # Or deployed URL
+                    "https://research-brief-generator-5c5c.onrender.com/brief",  # Or deployed URL
                     json={"topic": topic, "depth": depth, "follow_up": follow_up, "user_id": user_id}
                 )
                 response.raise_for_status()
@@ -60,7 +60,7 @@ if st.button("Generate Brief"):
 if view_history:
     with st.spinner("Loading history..."):
         try:
-            response = requests.get(f"http://localhost:8000/history/{user_id}")
+            response = requests.get(f"https://research-brief-generator-5c5c.onrender.com/history/{user_id}")
             response.raise_for_status()
             history = response.json()["history"]
             st.markdown("### User History")
