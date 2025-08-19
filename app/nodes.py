@@ -5,7 +5,7 @@ import json
 from typing import List
 from bs4 import BeautifulSoup
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEndpoint
+# from langchain_huggingface import HuggingFaceEndpoint
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.exceptions import OutputParserException
@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 
 # Initialize LLMs
 llm_gemini = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-llm_hf = HuggingFaceEndpoint(
-    repo_id="tiiuae/falcon-7b-instruct",
-    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
-    task="text-generation",
-    temperature=0,
-    max_new_tokens=256
-)
+# llm_hf = HuggingFaceEndpoint(
+#     repo_id="tiiuae/falcon-7b-instruct",
+#     huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+#     task="text-generation",
+#     temperature=0,
+#     max_new_tokens=256
+# )
 
 def context_summarization(state: AppState) -> AppState:
     if not isinstance(state, dict):

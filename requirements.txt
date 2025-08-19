@@ -1,10 +1,8 @@
 aiohttp==3.12.15
 beautifulsoup4==4.13.4
 fastapi==0.116.1
-huggingface_hub==0.25.2
 langchain>=0.3.27
 langchain-google-genai>=2.1.9
-langchain-huggingface>=0.0.3
 langchain-tavily==0.2.11
 langgraph==0.6.5
 langgraph-checkpoint==2.1.1
